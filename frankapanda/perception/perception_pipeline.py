@@ -23,6 +23,7 @@ import signal
 import sys
 from pathlib import Path
 from robo_utils.conversion_utils import transform_pcd
+from robo_utils.visualization.plotting import plot_pcd
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -202,6 +203,8 @@ def run_pipeline_iteration(receiver, publisher, bounds, num_points, receive_port
         'num_points': len(pcd_final),
         'bounds': bounds
     }
+
+    # plot_pcd(pcd_final, rgb_final, base_frame=True)
 
     # Publish final point cloud
     print("\n" + "="*60)

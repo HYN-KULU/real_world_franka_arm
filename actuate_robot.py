@@ -16,13 +16,13 @@ controller_cfg = YamlConfig(
 
 # These are home joints:
 target_joint_positions = [
-    0.09162008114028396,
-    -0.19826458111314524,
-    -0.01990020486871322,
-    -2.4732269941140346,
-    -0.01307073642274261,
-    2.30396583422025,
-    0.8480939705504309,
+    -1.3159,
+    -0.4246,
+     0.1067,
+    -2.7110,
+    -0.0562,
+     2.3219,
+     0.7518,
 ]
 
 action = target_joint_positions + [-1.0]    # Adding the gripper action
