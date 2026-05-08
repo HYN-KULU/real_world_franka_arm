@@ -62,6 +62,7 @@ class MotionPlanner:
             voxel_pose: Pose of the voxel grid center [x, y, z, qw, qx, qy, qz]. Default is [0, 0, 0, 1, 0, 0, 0].
         """
         
+        pointcloud = pointcloud[pointcloud[:, 1] >= 0]
         self.pointcloud = pointcloud
         self.reset_planner(pointcloud)
 
@@ -207,9 +208,9 @@ class MotionPlanner:
         self.world_config.add_obstacle(self.front_wall)
         self.world_config.add_obstacle(self.pointcloud_mesh)
         self.world_config.add_obstacle(self.right_wall)
-        self.world_config.add_obstacle(self.shelf_top)
-        self.world_config.add_obstacle(self.shelf_side_blocker)
-        self.world_config.add_obstacle(self.object_area_blocker)
+        # self.world_config.add_obstacle(self.shelf_top)
+        # self.world_config.add_obstacle(self.shelf_side_blocker)
+        # self.world_config.add_obstacle(self.object_area_blocker)
 
         motion_gen_config = MotionGenConfig.load_from_robot_config(
             robot_file,
@@ -228,8 +229,8 @@ class MotionPlanner:
         self.motion_gen.warmup(n_goalset=200)
 
         # Disable dummy blockers by default
-        self.motion_gen.world_coll_checker.enable_obstacle(enable=False, name="shelf_side_blocker")
-        self.motion_gen.world_coll_checker.enable_obstacle(enable=False, name="object_area_blocker")
+        # self.motion_gen.world_coll_checker.enable_obstacle(enable=False, name="shelf_side_blocker")
+        # self.motion_gen.world_coll_checker.enable_obstacle(enable=False, name="object_area_blocker")
 
     def enable_intermediate_pose_blockers(self, enable: bool = True):
         """
@@ -239,8 +240,9 @@ class MotionPlanner:
         Args:
             enable: If True, enable the blockers. If False, disable them.
         """
-        self.motion_gen.world_coll_checker.enable_obstacle(enable=enable, name="shelf_side_blocker")
-        self.motion_gen.world_coll_checker.enable_obstacle(enable=enable, name="object_area_blocker")
+        pass
+        # self.motion_gen.world_coll_checker.enable_obstacle(enable=enable, name="shelf_side_blocker")
+        # self.motion_gen.world_coll_checker.enable_obstacle(enable=enable, name="object_area_blocker")
 
     def set_collision_world_components(
         self,  
