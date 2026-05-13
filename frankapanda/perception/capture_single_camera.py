@@ -74,60 +74,52 @@ def main():
         print(f"[Camera {args.cam_id}] Capturing frame...")
         ir_frame, rgb_frame, pcd_raw, depth_frame = get_kinect_rgbd_frame(k4a)
 
-        # Reshape point cloud from image format to Nx3
-        pcd = pcd_raw.reshape(-1, 3)
+        # Preserve (H, W, 3) shape so downstream segmentation can run on the
+        # image grid and index the pcd by per-pixel masks.
+        H, W = pcd_raw.shape[:2]
 
-        # Convert from millimeters to meters
-        pcd = pcd / 1000.0
+        # mm -> meters; keep image shape.
+        pcd_hw3 = pcd_raw.astype(np.float32) / 1000.0   # (H, W, 3) meters in depth-cam frame
 
-        # Process RGB
-        rgb = rgb_frame[..., :-1].reshape(-1, 3)
-        # Convert BGR to RGB
-        rgb = rgb[:, [2, 1, 0]]
-        # Normalize to [0, 1]
-        rgb = rgb / 255.0
+        # RGB: drop alpha + BGR->RGB; keep uint8 for SAM/DINO.
+        rgb_hw3 = rgb_frame[..., :-1][..., ::-1].copy().astype(np.uint8)  # (H, W, 3) uint8
 
-        # Filter invalid points (distance == 0)
-        distances = np.linalg.norm(pcd, axis=1)
-        mask = distances > 0.0
-        pcd = pcd[mask]
-        rgb = rgb[mask]
+        # Invalid mask (depth == 0 -> zero-norm xyz).
+        distances = np.linalg.norm(pcd_hw3, axis=-1)
+        valid_mask = distances > 0.0  # (H, W) bool
+        print(f"[Camera {args.cam_id}] Valid pixels: {int(valid_mask.sum())}/{valid_mask.size}")
 
-        print(f"[Camera {args.cam_id}] Valid points after filtering: {len(pcd)}")
-
-        # Load and apply calibration transform (camera -> robot base)
-        # Get project root (go up from frankapanda/perception/ to root)
+        # Load and apply calibration transform (camera -> robot base).
         project_root = Path(__file__).parent.parent.parent
         calib_path = project_root / "data" / "calibration_results" / f"cam{args.cam_id}_calibration.npz"
-        # calib_path = project_root / "data" / "calibration_results" / f"depth_cam{args.cam_id}_camtoworld.npz"
         calib_data = np.load(calib_path)
         calibration_transform = calib_data['T']
 
         print(f"[Camera {args.cam_id}] Applying calibration transform...")
-        pcd = transform_pcd(pcd, calibration_transform)
+        pcd_hw3 = transform_pcd(pcd_hw3.reshape(-1, 3), calibration_transform).reshape(H, W, 3)
 
-        # Load and apply alignment transform
+        # Cam1 -> cam0 alignment.
         if args.cam_id == 0:
-            # Camera 0 is the reference frame, no alignment needed
             print(f"[Camera {args.cam_id}] No alignment needed (reference frame)")
         else:
-            # Camera 1: apply alignment to camera 0 frame
             alignment_path = project_root / "data" / "camera_alignments" / "cam1_to_cam0.npy"
             alignment_transform = np.load(alignment_path)
             print(f"[Camera {args.cam_id}] Applying alignment transform...")
-            pcd = transform_pcd(pcd, alignment_transform)
+            pcd_hw3 = transform_pcd(pcd_hw3.reshape(-1, 3), alignment_transform).reshape(H, W, 3)
 
-        # Prepare data to send
+        # Send the un-flattened arrays so the pipeline can run segmentation on
+        # rgb_hw3 and index pcd_hw3 by the resulting (H, W) mask.
         data = {
             'cam_id': args.cam_id,
-            'pcd': pcd,
-            'rgb': rgb
+            'pcd_hw3': pcd_hw3,         # (H, W, 3) float32, robot-base frame (cam0 frame for cam1)
+            'rgb_hw3': rgb_hw3,         # (H, W, 3) uint8 RGB
+            'valid_mask': valid_mask,   # (H, W) bool
         }
 
         print(f"[Camera {args.cam_id}] Sending data via ZMQ...")
         socket.send(pickle.dumps(data))
 
-        print(f"[Camera {args.cam_id}] Complete! Sent {len(pcd)} points")
+        print(f"[Camera {args.cam_id}] Complete! Sent ({H}, {W}, 3) rgb+pcd")
 
     finally:
         # Clean up

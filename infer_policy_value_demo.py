@@ -1,55 +1,55 @@
 """
-Minimal Demo: Real-world Policy + Value Inference (no robot exec)
+Minimal Demo: Real-world Policy + (optional) Value Inference, with optional
+robot execution of the predicted grasp.
 
 What it does:
-1. Grabs a single point cloud from the dual-Kinect perception pipeline.
-2. Downsamples to 4096 points (farthest-point).
-3. Applies the sim2real preprocessing (per-sample center + unit-radius
-   scale) the policy/value networks were trained on.
-4. Loads the latest sim2real grasp, place, and value checkpoints.
-5. Forwards through grasp policy, then place policy (conditioned on
-   the grasp), then the value network on (pcd, [grasp, place]).
-6. Prints the predicted poses and value score; visualizes the predicted
-   gripper poses in the point cloud.
+1. Pulls a clustered, FPS-downsampled point cloud from the perception
+   pipeline (run with `--cluster`).
+2. Picks one cluster uniformly at random as the target object; builds
+   a (N,) target_mask aligned to the FPS points.
+3. Calls PolicyValueInference to predict grasp + place poses (and a
+   value score when --use_value is set).
+4. Visualizes the target cluster + predicted gripper poses with Open3D.
+5. With --exec, runs the grasping portion of primitives_demo against
+   the predicted grasp pose (pre-grasp -> grasp -> close -> lift ->
+   home), then opens the gripper.
 
 Run prerequisites:
-1. Perception pipeline running:
-     python -m frankapanda.perception.perception_pipeline --continuous
-2. PYTHONPATH/.pth set up so `models.flowmatch_actor.*` and
-   `visplan.submodules.robo_utils.*` resolve out of visplanWM. The
-   setup_frankapanda_3dfa.sh script drops a visplanWM.pth into the env
-   site-packages.
+1. Perception pipeline running with clustering enabled:
+     python -m frankapanda.perception.perception_pipeline --continuous --cluster
+2. visplanWM .pth on PYTHONPATH (setup_frankapanda_3dfa.sh handles this).
+3. For --exec: robot powered on and reachable by FrankaPandaController.
 
 Usage:
     conda activate frankapanda_3dfa
+    # policy only
     python infer_policy_value_demo.py
+    # policy + value
+    python infer_policy_value_demo.py --use_value
+    # policy + execute grasp on the real robot
+    python infer_policy_value_demo.py --exec
 """
 
 import argparse
 import os
-import time
 
 import numpy as np
-import open3d as o3d
 import torch
+from scipy.spatial.transform import Rotation as R
 
-# robo_utils (frankapanda's editable install — same API as visplanWM's submodule)
 from robo_utils.visualization.plotting import plot_pcd
 from robo_utils.visualization.point_cloud_structures import make_gripper_visualization
 from robo_utils.conversion_utils import (
-    furthest_point_sample,
     pose_to_transformation,
+    move_pose_along_local_z,
+    rotate_pose_around_local_z,
 )
 
-# Perception client.
+from frankapanda import FrankaPandaController
 from frankapanda.perception import PerceptionPipeline
+from frankapanda.motionplanner import MotionPlanner
 
-# visplanWM model code, resolved via the .pth that points sys.path at
-# /home/ksaha/Research/ModelBasedPlanning/visplanWM/
-from models.flowmatch_actor.modeling.policy_grasp_place.denoise_actor_3d_packing import (
-    DenoiseActor as GraspPlaceActor,
-)
-from models.flowmatch_actor.modeling.policy.value_network import ValueNetwork
+from policy_value_inference import PolicyValueInference
 
 
 # --------------------------------------------------------------------------- #
@@ -71,95 +71,35 @@ DEFAULT_VALUE_CKPT = os.path.join(
     "models/flowmatch_actor/train_logs/Value_Function_Planning/sim2real_q_value_v3/best.pth",
 )
 
-NUM_POINTS = 4096
-
-# Policy ctor kwargs — must match what train_for_shelf_packing_grasp_place.py
-# and visplan/action_sampling.py:_POLICY_KWARGS use for the cascaded
-# grasp/place pair.
-_POLICY_KWARGS = dict(
-    embedding_dim=120,
-    num_attn_heads=8,
-    nhist=1,
-    num_shared_attn_layers=4,
-    relative=False,
-    rotation_format="quat_wxyz",
-    denoise_timesteps=10,
-    denoise_model="rectified_flow",
-    lv2_batch_size=1,
-    pcd_input_channels=4,
-)
-
-VALUE_KWARGS = dict(
-    embedding_dim=120,
-    num_attn_heads=8,
-    num_shared_attn_layers=4,
-)
-
 
 # --------------------------------------------------------------------------- #
-# Checkpoint loader (mirrors visplan.shelf_packing_base.load_checkpoint_for_eval)
+# Pose post-processing: force top-down (gripper z-axis = -world z), preserve yaw.
 # --------------------------------------------------------------------------- #
 
-def load_checkpoint_for_eval(checkpoint_path: str, model: torch.nn.Module) -> torch.nn.Module:
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(checkpoint_path)
-    try:
-        blob = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    except Exception as e:
-        if "numpy.core.multiarray.scalar" in str(e):
-            blob = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        else:
-            raise
-    msn, unx = model.load_state_dict(blob["weight"], strict=False)
-    if msn:
-        print(f"  [{os.path.basename(checkpoint_path)}] missing keys: {len(msn)}")
-    if unx:
-        print(f"  [{os.path.basename(checkpoint_path)}] unexpected keys: {len(unx)}")
-    if not msn and not unx:
-        print(f"  [{os.path.basename(checkpoint_path)}] all keys matched")
-    del blob
-    return model
+def make_topdown(pose7_wxyz):
+    """
+    Project a (7,) pose [x, y, z, qw, qx, qy, qz] onto the top-down manifold:
+    gripper local z-axis aligned with -world_z. Yaw around world z is taken
+    from the input's gripper x-axis direction. Position is unchanged.
+    """
+    is_tensor = isinstance(pose7_wxyz, torch.Tensor)
+    p = pose7_wxyz.detach().cpu().numpy() if is_tensor else np.asarray(pose7_wxyz)
+    pos = p[:3]
+    qw, qx, qy, qz = p[3:7]
+    mat = R.from_quat([qx, qy, qz, qw]).as_matrix()
+    # Yaw from gripper x-axis projection onto world xy.
+    x_world = mat[:, 0]
+    yaw = float(np.arctan2(x_world[1], x_world[0]))
+    # Compose: rotate 180° about x (z -> -z), then yaw about world z.
+    R_target = R.from_euler("z", yaw) * R.from_euler("x", np.pi)
+    qx_o, qy_o, qz_o, qw_o = R_target.as_quat()
+    out = np.concatenate([pos, [qw_o, qx_o, qy_o, qz_o]]).astype(np.float32)
 
+    out[..., 0] = out[..., 0] - 0.02
+    out[..., 1] = out[..., 1] - 0.02
+    out[..., 2] = out[..., 2] + 0.04
 
-def build_models(grasp_ckpt: str, place_ckpt: str, value_ckpt: str, device: torch.device):
-    print("Building grasp_only policy")
-    grasp_kwargs = dict(_POLICY_KWARGS)
-    grasp_kwargs["trajectory_length"] = 1
-    grasp_kwargs["grasp_condition_dim"] = None
-    grasp_model = GraspPlaceActor(**grasp_kwargs)
-    grasp_model = load_checkpoint_for_eval(grasp_ckpt, grasp_model).to(device).eval()
-
-    print("Building place_conditional policy")
-    place_kwargs = dict(_POLICY_KWARGS)
-    place_kwargs["trajectory_length"] = 1
-    place_kwargs["grasp_condition_dim"] = 7
-    place_model = GraspPlaceActor(**place_kwargs)
-    place_model = load_checkpoint_for_eval(place_ckpt, place_model).to(device).eval()
-
-    print("Building value network")
-    value_model = ValueNetwork(**VALUE_KWARGS)
-    value_model = load_checkpoint_for_eval(value_ckpt, value_model).to(device).eval()
-
-    return grasp_model, place_model, value_model
-
-
-# --------------------------------------------------------------------------- #
-# Sim2real per-sample preprocessing (center + max-radius scale)
-# Matches sim2real_augment.center_and_scale (deterministic, no augmentation).
-# +0.615 is a no-op after centering, so we skip it for real PCDs that
-# already live in robot-base frame.
-# --------------------------------------------------------------------------- #
-
-def center_and_scale(pcd_xyz: torch.Tensor, eps: float = 1e-6):
-    centroid = pcd_xyz.mean(dim=0)                       # (3,)
-    centered = pcd_xyz - centroid
-    radius = centered.norm(dim=-1).max()
-    scale = torch.clamp(radius, min=eps)
-    return centered / scale, centroid, scale
-
-
-def unscale_action_xyz(xyz_norm: torch.Tensor, centroid: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return xyz_norm * scale + centroid
+    return torch.from_numpy(out) if is_tensor else out
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +132,153 @@ def visualize_poses_in_pointcloud(pcd, poses, rgb=None, colors=None):
 
 
 # --------------------------------------------------------------------------- #
+# Robot execution of the predicted grasp (taken from primitives_demo.py)
+# --------------------------------------------------------------------------- #
+
+def execute_grasp(grasp_pose: torch.Tensor, pcd_np: np.ndarray, device: torch.device):
+    """
+    Mirror primitives_demo.main() end-to-end, with the policy-predicted grasp
+    pose substituted for the hardcoded one. Sequence:
+
+        home -> pre_grasp -> grasp -> close -> lift -> inter -> target_shelf
+             -> open -> reverse_target -> home
+
+    Args:
+        grasp_pose: (7,) torch.Tensor xyz + quat_wxyz in robot-base frame.
+        pcd_np: scene point cloud used to populate the motion planner world.
+        device: torch device for joint/pose tensors (motion_planner expects cuda).
+    """
+    controller = FrankaPandaController()
+    controller.move_to_joints(controller.home_joints, controller.open_gripper_action)
+
+    current_joints = controller.get_robot_joints()
+    current_joints = torch.tensor(current_joints, dtype=torch.float32, device=device)
+
+    motion_planner = MotionPlanner(pcd_np)
+
+    # === Grasp pose comes from the policy (replaces primitives_demo hardcode) ===
+    grasp_pose = grasp_pose.to(device=device, dtype=torch.float32)
+
+    # Pre-grasp: back off 12 cm along local gripper z-axis.
+    pre_grasp_pose = move_pose_along_local_z(grasp_pose, -0.12)
+    pre_grasp_pose = torch.tensor(pre_grasp_pose, dtype=torch.float32, device=device)
+
+    # Target shelf pose — hardcoded, matches primitives_demo.
+    # TODO: edge of the shelf, not inside it.
+    target_shelf_pose = torch.tensor(
+        [0.559, -0.06, 0.285, 0.7071, -0.7071, 0.0, 0.0],
+        dtype=torch.float32, device=device,
+    )
+    target_shelf_pose = torch.tensor(
+        rotate_pose_around_local_z(target_shelf_pose, np.pi / 2, format='wxyz'),
+        dtype=torch.float32, device=device,
+    )
+    
+    # Lift: grasp xyz with z lifted to shelf height.
+    lift_pose = grasp_pose.clone()
+    lift_pose[2] = target_shelf_pose[2]
+
+    # Intermediate retraction in front of shelf before insertion.
+    inter_pose = target_shelf_pose.clone()
+    inter_pose[0] = target_shelf_pose[0]
+    inter_pose[1] = -0.25
+    inter_pose[2] = target_shelf_pose[2]
+
+    # Visualize the planned waypoints before executing anything.
+    # cyan=pre_grasp, green=grasp, yellow=lift, orange=inter, blue=target_shelf.
+    print("Visualizing intermediate poses in pcd: "
+          "cyan=pre_grasp, green=grasp, yellow=lift, orange=inter, blue=target")
+    visualize_poses_in_pointcloud(
+        pcd_np,
+        [pre_grasp_pose, grasp_pose, lift_pose, inter_pose, target_shelf_pose],
+        rgb=None,
+        colors=[
+            (0.0, 1.0, 1.0),  # cyan
+            (0.0, 1.0, 0.0),  # green
+            (1.0, 1.0, 0.0),  # yellow
+            (1.0, 0.5, 0.0),  # orange
+            (0.0, 0.0, 1.0),  # blue
+        ],
+    )
+
+    controller.open_gripper()
+
+    pre_grasp_trajectories, pre_grasp_success = motion_planner.plan_to_goal_poses(
+        current_joints=current_joints.unsqueeze(0),
+        goal_poses=pre_grasp_pose.unsqueeze(0),
+    )
+    print(f"  pre_grasp success: {pre_grasp_success.item()}")
+
+    grasp_trajectories, grasp_success = motion_planner.plan_to_goal_poses(
+        current_joints=pre_grasp_trajectories[0, -1].unsqueeze(0),
+        goal_poses=grasp_pose.unsqueeze(0),
+        disable_collision_links=motion_planner.links[-5:],
+        plan_config=motion_planner.along_z_axis_plan_config,
+    )
+    print(f"  grasp success: {grasp_success.item()}")
+
+    lift_trajectories, lift_success = motion_planner.plan_to_goal_poses(
+        current_joints=grasp_trajectories[0, -1].unsqueeze(0),
+        goal_poses=lift_pose.unsqueeze(0),
+        disable_collision_links=motion_planner.links[-5:],
+        plan_config=motion_planner.lift_plan_config,
+    )
+    print(f"  lift success: {lift_success.item()}")
+
+    inter_pose_trajectories, inter_pose_success = motion_planner.plan_to_goal_poses(
+        current_joints=lift_trajectories[0, -1].unsqueeze(0),
+        goal_poses=inter_pose.unsqueeze(0),
+        plan_config=motion_planner.only_xy_translation_plan_config,
+    )
+    print(f"  inter_pose success: {inter_pose_success.item()}")
+
+    target_trajectories, target_success = motion_planner.plan_to_goal_poses(
+        current_joints=inter_pose_trajectories[0, -1].unsqueeze(0),
+        goal_poses=target_shelf_pose.unsqueeze(0),
+        disable_collision_links=motion_planner.links[-5:],
+        plan_config=motion_planner.along_z_axis_plan_config,
+    )
+    print(f"  target success: {target_success.item()}")
+
+    success = (
+        pre_grasp_success.item()
+        & grasp_success.item()
+        & lift_success.item()
+        & inter_pose_success.item()
+        & target_success.item()
+    )
+    if not success:
+        print("  ABORT: one or more plans failed.")
+        controller.move_to_joints(controller.home_joints, controller.close_gripper_action)
+        controller.open_gripper()
+        return
+
+    controller.move_along_trajectory(
+        pre_grasp_trajectories[0].cpu().numpy(), controller.open_gripper_action
+    )
+    controller.move_along_trajectory(
+        grasp_trajectories[0].cpu().numpy(), controller.open_gripper_action
+    )
+    controller.close_gripper(num_steps=80)
+    controller.move_along_trajectory(
+        lift_trajectories[0].cpu().numpy(), controller.close_gripper_action
+    )
+    controller.move_along_trajectory(
+        inter_pose_trajectories[0].cpu().numpy(), controller.close_gripper_action
+    )
+    controller.move_along_trajectory(
+        target_trajectories[0].cpu().numpy(), controller.close_gripper_action
+    )
+    controller.open_gripper(num_steps=80)
+    controller.move_along_trajectory(
+        target_trajectories[0].flip(0).cpu().numpy(), controller.open_gripper_action
+    )
+
+    controller.move_to_joints(controller.home_joints, controller.close_gripper_action)
+    controller.open_gripper()
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
@@ -202,153 +289,123 @@ def main():
     parser.add_argument("--value_ckpt", default=DEFAULT_VALUE_CKPT)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--publish_port", type=int, default=1235)
+    parser.add_argument("--use_value", action="store_true",
+                        help="Also load and run the value network; print + use the scalar score.")
     parser.add_argument("--no_viz", action="store_true",
                         help="Skip Open3D visualization (headless).")
+    parser.add_argument("--no_exec", dest="execute", action="store_false",
+                        help="Skip robot execution (default: execute the predicted grasp).")
+    parser.set_defaults(execute=True)
+    parser.add_argument("--target_label", type=str, default=None,
+                        help="Pick this segmentation label (e.g. 'blue block') as the target. "
+                             "If unset and seg_labels are present, picks the first non-empty label. "
+                             "Falls back to a random DBSCAN cluster if no seg_labels in payload.")
     args = parser.parse_args()
 
     device = torch.device(args.device)
 
-    # 1. Models
-    grasp_model, place_model, value_model = build_models(
-        args.grasp_ckpt, args.place_ckpt, args.value_ckpt, device
+    # 1. Inference object (loads value net only if --use_value).
+    inference = PolicyValueInference(
+        grasp_ckpt=args.grasp_ckpt,
+        place_ckpt=args.place_ckpt,
+        value_ckpt=args.value_ckpt if args.use_value else None,
+        device=device,
+        use_value=args.use_value,
     )
 
-    # 2. Perception
+    # 2. Perception — pipeline does bounds + clustering + FPS to num_points.
     print("Connecting to perception pipeline")
     perception = PerceptionPipeline(publish_port=args.publish_port, timeout_ms=10000)
     print("Capturing point cloud")
     try:
-        pcd_np, rgb_np = perception.get_point_cloud()
+        data = perception.get_point_cloud_dict()
     except TimeoutError:
         print("Timeout waiting for PCD. Is `python -m frankapanda.perception."
-              "perception_pipeline --continuous` running?")
+              "perception_pipeline --continuous --segment` (or --cluster) running?")
         return
-    print(f"  raw pcd: {pcd_np.shape}  rgb: {rgb_np.shape}")
+    pcd_np = data["pcd"]
+    rgb_np = data["rgb"]
+    seg_labels = data.get("seg_labels")
+    seg_label_names = data.get("seg_label_names")
+    cluster_labels = data.get("cluster_labels")
 
-    # z-bounds now applied upstream in perception_pipeline (bounds dict);
-    # pcd arrives clean within [table, roof].
-
-    # DBSCAN cluster the masked pcd into object groups.
-    pcd_o3d = o3d.geometry.PointCloud()
-    pcd_o3d.points = o3d.utility.Vector3dVector(pcd_np)
-    cluster_labels = np.asarray(pcd_o3d.cluster_dbscan(eps=0.02, min_points=20, print_progress=False))
-    num_clusters = int(cluster_labels.max() + 1) if cluster_labels.size and cluster_labels.max() >= 0 else 0
-    num_noise = int((cluster_labels == -1).sum())
-    print(f"  dbscan: {num_clusters} clusters, {num_noise} noise points / {len(pcd_np)} total")
-
-    # Reassign noise points to nearest cluster (no -1 allowed).
-    if num_noise > 0 and num_clusters > 0:
-        non_noise = cluster_labels != -1
-        kdtree = o3d.geometry.KDTreeFlann(
-            o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pcd_np[non_noise]))
+    # 3. Build target mask. Prefer segmentation labels when present.
+    if seg_labels is not None and seg_label_names is not None:
+        seg_labels = np.asarray(seg_labels)
+        per_label_counts = {n: int((seg_labels == k).sum()) for k, n in enumerate(seg_label_names)}
+        print(f"  pcd: {pcd_np.shape}  seg per-label counts: {per_label_counts}")
+        if args.target_label is not None:
+            if args.target_label not in seg_label_names:
+                raise RuntimeError(
+                    f"--target_label='{args.target_label}' not in {seg_label_names}"
+                )
+            chosen_idx = seg_label_names.index(args.target_label)
+        else:
+            # First non-empty label.
+            chosen_idx = next(
+                (k for k in range(len(seg_label_names)) if (seg_labels == k).any()), None
+            )
+            if chosen_idx is None:
+                raise RuntimeError("All segmentation labels are empty on this frame.")
+        chosen_name = seg_label_names[chosen_idx]
+        mask_np = (seg_labels == chosen_idx).astype(np.float32)
+        print(f"  chosen seg label: {chosen_idx} ('{chosen_name}') "
+              f"({int(mask_np.sum())}/{len(pcd_np)} points)")
+    elif cluster_labels is not None:
+        cluster_labels = np.asarray(cluster_labels)
+        num_clusters = int(cluster_labels.max() + 1)
+        print(f"  pcd: {pcd_np.shape}  clusters: {num_clusters} (no seg_labels — falling back)")
+        chosen_cid = int(np.random.randint(num_clusters))
+        mask_np = (cluster_labels == chosen_cid).astype(np.float32)
+        print(f"  chosen cluster: {chosen_cid} ({int(mask_np.sum())}/{len(pcd_np)} points)")
+    else:
+        raise RuntimeError(
+            "Pipeline payload has neither seg_labels nor cluster_labels. Re-run "
+            "perception_pipeline with --segment or --cluster."
         )
-        non_noise_labels = cluster_labels[non_noise]
-        for ni in np.where(~non_noise)[0]:
-            _, idx, _ = kdtree.search_knn_vector_3d(pcd_np[ni], 1)
-            cluster_labels[ni] = non_noise_labels[idx[0]]
-        print(f"  reassigned {num_noise} noise points to nearest cluster")
-    elif num_clusters == 0:
-        raise RuntimeError("DBSCAN found no clusters; loosen eps / lower min_points.")
 
-    # Pick a random cluster as the target object; build per-point mask.
-    chosen_cid = int(np.random.randint(num_clusters))
-    full_mask = (cluster_labels == chosen_cid).astype(np.float32)
-    print(f"  chosen cluster: {chosen_cid} ({int(full_mask.sum())}/{len(pcd_np)} points)")
+    # 4. Visualize the chosen cluster (red) on full pcd (gray).
+    # if not args.no_viz:
+    #     viz_rgb = np.where(
+    #         mask_np[:, None].astype(bool),
+    #         np.array([1.0, 0.0, 0.0], dtype=np.float32),
+    #         np.array([0.5, 0.5, 0.5], dtype=np.float32),
+    #     )
+    #     plot_pcd(pcd_np, viz_rgb, base_frame=True)
 
-    # Visualize the full pcd with the chosen cluster highlighted (red=target, gray=rest).
-    viz_rgb = np.where(
-        full_mask[:, None].astype(bool),
-        np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        np.array([0.5, 0.5, 0.5], dtype=np.float32),
-    )
-    plot_pcd(pcd_np, viz_rgb, base_frame=True)
+    # 5. Inference.
+    result = inference.infer(pcd_np, mask_np)
+    grasp_pose_robot = result["grasp_pose"]
+    place_pose_robot = result["place_pose"]
 
-    # 3. Downsample to NUM_POINTS via FPS (robo_utils wraps open3d).
-    t0 = time.time()
-    pcd_fps_np = furthest_point_sample(pcd_np, num_points=NUM_POINTS)
-    print(f"  fps -> {pcd_fps_np.shape} in {time.time() - t0:.2f}s")
+    # Force top-down grasp: gripper z-axis -> -world z, yaw preserved from policy.
+    grasp_pose_robot = make_topdown(grasp_pose_robot)
+    print(f"  grasp pose (xyz+quat_wxyz, robot frame, top-down): {grasp_pose_robot.tolist()}")
+    print(f"  place pose (xyz+quat_wxyz, robot frame, raw): {place_pose_robot.tolist()}")
+    if result["value_score"] is not None:
+        print(f"  value score (sigmoid): {result['value_score']:.4f}")
 
-    # Map each FPS point back to its nearest neighbor in pcd_np to carry mask through.
-    full_tree = o3d.geometry.KDTreeFlann(
-        o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pcd_np))
-    )
-    fps_indices = np.empty(len(pcd_fps_np), dtype=np.int64)
-    for i, p in enumerate(pcd_fps_np):
-        _, idx, _ = full_tree.search_knn_vector_3d(p, 1)
-        fps_indices[i] = idx[0]
-    fps_mask_np = full_mask[fps_indices]                            # (N,)
+    # 6. Visualize grippers + cluster highlight.
+    # if not args.no_viz:
+    #     print("Visualizing: red=target cluster, gray=rest, green=grasp, blue=place")
+    #     viz_rgb = np.where(
+    #         mask_np[:, None].astype(bool),
+    #         np.array([1.0, 0.0, 0.0], dtype=np.float32),
+    #         np.array([0.5, 0.5, 0.5], dtype=np.float32),
+    #     )
+    #     visualize_poses_in_pointcloud(
+    #         pcd_np,
+    #         [grasp_pose_robot, place_pose_robot],
+    #         rgb=viz_rgb,
+    #         colors=[(0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
+    #     )
 
-    pcd_fps = torch.from_numpy(pcd_fps_np).float()                 # (N, 3) robot frame
+    # 7. Optional execution of the predicted grasp on the real robot.
+    if args.execute:
+        print("Executing predicted grasp on robot")
+        execute_grasp(grasp_pose_robot, pcd_np, device)
 
-    # 4. Per-sample center + scale (the sim2real normalization).
-    pcd_norm, centroid, scale = center_and_scale(pcd_fps)
-    print(f"  centroid={centroid.tolist()}  scale={scale.item():.4f}")
-    pcd_norm_dev = pcd_norm.unsqueeze(0).to(device)                 # (1, N, 3) — value net input (xyz only)
-
-    # 4b. Build 4-channel pcd (xyz + target_mask) for grasp/place policies.
-    # Mask = 1.0 on target-object points, 0.0 elsewhere. Only xyz is normalized.
-    target_mask = torch.from_numpy(fps_mask_np).to(pcd_norm.dtype).unsqueeze(-1)  # (N, 1)
-    pcd_norm_masked_dev = torch.cat(
-        [pcd_norm, target_mask], dim=-1
-    ).unsqueeze(0).to(device)                                       # (1, N, 4)
-    print(f"  target_mask: {int(target_mask.sum())}/{target_mask.numel()} fps points marked (cluster {chosen_cid})")
-
-    # 5. Grasp policy forward.
-    with torch.no_grad():
-        grasp_out = grasp_model(
-            gt_trajectory=None, pcd=pcd_norm_masked_dev,
-            proprioception=None, run_inference=True,
-        )                                                            # (1, 1, 8)
-    grasp_pose_norm = grasp_out[0, 0].cpu()                          # (8,) pos+quat_wxyz+gripper
-    grasp_pos_robot = unscale_action_xyz(
-        grasp_pose_norm[:3], centroid, scale,
-    )
-    grasp_pose_robot = torch.cat([grasp_pos_robot, grasp_pose_norm[3:7]])  # (7,)
-    print(f"  grasp pose (robot frame, xyz+quat_wxyz): {grasp_pose_robot.tolist()}")
-
-    # 6. Place policy forward, conditioned on the grasp pose.
-    # The place model expects `grasp_cond` in the SAME normalized frame
-    # the PCD lives in — same center+scale.
-    grasp_cond_norm = torch.cat([grasp_pose_norm[:3], grasp_pose_norm[3:7]]).unsqueeze(0)  # (1, 7)
-    grasp_cond_dev = grasp_cond_norm.to(device)
-    with torch.no_grad():
-        place_out = place_model(
-            gt_trajectory=None, pcd=pcd_norm_masked_dev,
-            proprioception=None, run_inference=True,
-            grasp_cond=grasp_cond_dev,
-        )                                                            # (1, 1, 8)
-    place_pose_norm = place_out[0, 0].cpu()
-    place_pos_robot = unscale_action_xyz(
-        place_pose_norm[:3], centroid, scale,
-    )
-    place_pose_robot = torch.cat([place_pos_robot, place_pose_norm[3:7]])
-    print(f"  place pose (robot frame, xyz+quat_wxyz): {place_pose_robot.tolist()}")
-
-    # 7. Value network — takes pcd (B,N,3) + actions (B,2,8) in the same
-    # normalized frame the policy used. Use the raw 8-D pose (with the
-    # mode-hardcoded gripper channel) directly.
-    actions_norm = torch.stack([grasp_pose_norm, place_pose_norm], dim=0).unsqueeze(0)  # (1,2,8)
-    actions_norm_dev = actions_norm.to(device)
-    with torch.no_grad():
-        score = value_model(pcd=pcd_norm_dev, actions=actions_norm_dev).cpu()
-    print(f"  value score (sigmoid): {score.item():.4f}")
-
-    # 8. Visualize predicted gripper poses on the (unnormalized) PCD.
-    # Color FPS pcd by target_mask (red=target cluster, gray=rest); overlay
-    # grippers via make_gripper_visualization (green=grasp, blue=place).
-    if not args.no_viz:
-        print("Visualizing: red=target cluster, gray=rest, green=grasp, blue=place")
-        fps_viz_rgb = np.where(
-            fps_mask_np[:, None].astype(bool),
-            np.array([1.0, 0.0, 0.0], dtype=np.float32),
-            np.array([0.5, 0.5, 0.5], dtype=np.float32),
-        )
-        visualize_poses_in_pointcloud(
-            pcd_fps_np,
-            [grasp_pose_robot, place_pose_robot],
-            rgb=fps_viz_rgb,
-            colors=[(0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
-        )
+    perception.close()
 
 
 if __name__ == "__main__":
