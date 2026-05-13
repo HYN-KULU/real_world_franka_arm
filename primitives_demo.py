@@ -25,7 +25,8 @@ from robo_utils.conversion_utils import (
     pose_to_transformation, 
     transform_pcd, 
     rotate_pose_around_local_x,
-    move_pose_along_local_z
+    move_pose_along_local_z,
+    rotate_pose_around_local_z
 )
 
 # Import from frankapanda package
@@ -97,6 +98,8 @@ def main():
     except TimeoutError as e:
         print("Make sure the perception pipeline is running!")
         return
+    
+    plot_pcd(pcd, rgb, base_frame=True)
 
     controller.move_to_joints(controller.home_joints, controller.open_gripper_action)
 
@@ -107,12 +110,12 @@ def main():
     motion_planner = MotionPlanner(pcd)
 
     # Get current gripper pose
-    gripper_pose = motion_planner.fk(current_joints).cpu().numpy()
-    visualize_gripper_in_pointcloud(pcd, gripper_pose, rgb=rgb, base_frame=True)
+    # gripper_pose = motion_planner.fk(current_joints).cpu().numpy()
+    # visualize_gripper_in_pointcloud(pcd, gripper_pose, rgb=rgb, base_frame=True)
 
     # Grasp Pose
     grasp_pose = torch.tensor(
-        [0.43239057, -0.3163708, 0.19059757, 0.00328029, -0.9574287, 0.28860268, -0.00530971],
+        [0.43239057, -0.3163708, 0.35059757, 0.00328029, -0.9574287, 0.28860268, -0.00530971],
         dtype=torch.float32,
         device="cuda:0"
     )
@@ -125,10 +128,11 @@ def main():
     # Target Shelf Pose
     # TODO: Remember to change this to edge of the shelf, not inside it
     target_shelf_pose = torch.tensor(
-        [0.559, -0.06, 0.285, 0.7071, -0.7071, 0.0, 0.0],
+        [0.559, -0.06, 0.235, 0.7071, -0.7071, 0.0, 0.0],
         dtype=torch.float32,
         device="cuda:0"
     )
+    target_shelf_pose = torch.tensor(rotate_pose_around_local_z(target_shelf_pose, np.pi/2, format='wxyz'), dtype=torch.float32, device="cuda:0")
 
     # Visualize grasp and target poses: red=grasp, green=target
     print("Visualizing poses: red=grasp, green=target")
@@ -149,15 +153,15 @@ def main():
     inter_pose[1] = -0.25   # Hard-coded retraction Y-value before inserting into shelf
     inter_pose[2] = target_shelf_pose[2]   # Z value (height) same as target
 
-    pre_push_pose = torch.tensor(
-        [0.519, -0.25, 0.399, -0.5, 0.5, 0.5, 0.5],
-        dtype=torch.float32,
-        device="cuda:0"
-    )
-    push_pose = move_pose_along_local_z(pre_push_pose, 0.33)
-    push_pose = torch.tensor(push_pose, dtype=torch.float32, device="cuda:0")
+    # pre_push_pose = torch.tensor(
+    #     [0.519, -0.25, 0.399, -0.5, 0.5, 0.5, 0.5],
+    #     dtype=torch.float32,
+    #     device="cuda:0"
+    # )
+    # push_pose = move_pose_along_local_z(pre_push_pose, 0.33)
+    # push_pose = torch.tensor(push_pose, dtype=torch.float32, device="cuda:0")
 
-    all_poses = [pre_grasp_pose, grasp_pose, lift_pose, inter_pose, target_shelf_pose, pre_push_pose, push_pose]
+    # all_poses = [pre_grasp_pose, grasp_pose, lift_pose, inter_pose, target_shelf_pose, pre_push_pose, push_pose]
     # Visualize all poses in pointcloud
     # for pose in all_poses[-3:]:
     #     visualize_gripper_in_pointcloud(pcd, pose.cpu().numpy(), rgb=rgb, base_frame=True)

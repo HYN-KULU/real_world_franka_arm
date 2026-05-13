@@ -99,6 +99,7 @@ def main():
         # Get project root (go up from frankapanda/perception/ to root)
         project_root = Path(__file__).parent.parent.parent
         calib_path = project_root / "data" / "calibration_results" / f"cam{args.cam_id}_calibration.npz"
+        # calib_path = project_root / "data" / "calibration_results" / f"depth_cam{args.cam_id}_camtoworld.npz"
         calib_data = np.load(calib_path)
         calibration_transform = calib_data['T']
 

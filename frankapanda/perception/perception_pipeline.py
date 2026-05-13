@@ -49,6 +49,7 @@ def apply_spatial_bounds(pcd, rgb, bounds):
         filtered_pcd, filtered_rgb
     """
     mask = np.ones(len(pcd), dtype=bool)
+    # plot_pcd(pcd, rgb, base_frame=True)
 
     # Apply bounds on each axis
     for axis_idx, axis_name in enumerate(['x', 'y', 'z']):
@@ -129,7 +130,7 @@ def capture_camera(cam_id, zmq_port):
     return True
 
 
-def run_pipeline_iteration(receiver, publisher, bounds, num_points, receive_port, save=False, iteration=None):
+def run_pipeline_iteration(receiver, publisher, bounds, num_points, receive_port, save=False, iteration=None, no_downsample=False):
     """
     Run one iteration of the perception pipeline.
 
@@ -141,6 +142,7 @@ def run_pipeline_iteration(receiver, publisher, bounds, num_points, receive_port
         receive_port: Port for receiving camera data
         save: Whether to save output to file
         iteration: Iteration number (for logging in continuous mode)
+        no_downsample: If True, skip FPS and combine; publish per-camera bounds-filtered pcds for alignment.
 
     Returns:
         True if successful, False otherwise
@@ -163,6 +165,47 @@ def run_pipeline_iteration(receiver, publisher, bounds, num_points, receive_port
         data = pickle.loads(receiver.recv())
         camera_data[cam_id] = data
         print(f"{iter_prefix}Received {len(data['pcd'])} points from Camera {cam_id}")
+
+    if no_downsample:
+        print("\n" + "="*60)
+        print(f"{iter_prefix}NO-DOWNSAMPLE MODE: bounds per camera, publish separately")
+        print("="*60)
+        print(f"{iter_prefix}Bounds: {bounds}")
+
+        cam0_pcd_f, cam0_rgb_f = apply_spatial_bounds(
+            camera_data[0]['pcd'], camera_data[0]['rgb'], bounds
+        )
+        cam1_pcd_f, cam1_rgb_f = apply_spatial_bounds(
+            camera_data[1]['pcd'], camera_data[1]['rgb'], bounds
+        )
+        print(f"{iter_prefix}Camera 0 after bounds: {len(cam0_pcd_f)} points")
+        print(f"{iter_prefix}Camera 1 after bounds: {len(cam1_pcd_f)} points")
+
+        final_data = {
+            'no_downsample': True,
+            'cam0_pcd': cam0_pcd_f,
+            'cam0_rgb': cam0_rgb_f,
+            'cam1_pcd': cam1_pcd_f,
+            'cam1_rgb': cam1_rgb_f,
+            'bounds': bounds,
+        }
+
+        print("\n" + "="*60)
+        print(f"{iter_prefix}PUBLISHING PER-CAMERA POINT CLOUDS (no downsample)")
+        print("="*60)
+        publisher.send(pickle.dumps(final_data))
+        print(f"{iter_prefix}Published per-camera point clouds")
+
+        if save:
+            output_dir = Path(__file__).parent / "data" / "perception_output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            np.save(output_dir / "cam0_pcd_raw.npy", cam0_pcd_f)
+            np.save(output_dir / "cam0_rgb_raw.npy", cam0_rgb_f)
+            np.save(output_dir / "cam1_pcd_raw.npy", cam1_pcd_f)
+            np.save(output_dir / "cam1_rgb_raw.npy", cam1_rgb_f)
+            print(f"\n{iter_prefix}Saved per-camera pcds to {output_dir}/")
+
+        return True
 
     # Combine point clouds from both cameras
     print("\n" + "="*60)
@@ -241,6 +284,8 @@ def main():
                         help='Number of points for FPS downsampling (default: 4096)')
     parser.add_argument('--save', action='store_true',
                         help='Save final point cloud to data/perception_output/')
+    parser.add_argument('--no_downsample', action='store_true',
+                        help='Skip FPS+combine; publish per-camera bounds-filtered pcds for alignment.')
     parser.add_argument('--continuous', action='store_true',
                         help='Run continuously in a loop (default: single-shot)')
     parser.add_argument('--rate', type=float, default=1.0,
@@ -256,11 +301,12 @@ def main():
         print(f"Loop rate: {args.rate} Hz (period: {1.0/args.rate:.2f}s)")
         print("Press Ctrl+C to stop\n")
 
-    # Define spatial bounds
+    # Define spatial bounds. Tight z = table → roof so FPS downstream
+    # keeps a clean 4096 within the workspace.
     bounds = {
         'x': [0.2, 0.8],
         'y': [-0.5, 0.5],
-        'z': [-0.03, 0.7]
+        'z': [-0.03, 0.24],
     }
 
     # Setup ZMQ receiver socket (PULL mode)
@@ -291,7 +337,8 @@ def main():
 
                 success = run_pipeline_iteration(
                     receiver, publisher, bounds, args.num_points,
-                    args.receive_port, args.save, iteration
+                    args.receive_port, args.save, iteration,
+                    no_downsample=args.no_downsample,
                 )
 
                 if not success:
@@ -319,7 +366,8 @@ def main():
             # Single-shot mode - run once
             success = run_pipeline_iteration(
                 receiver, publisher, bounds, args.num_points,
-                args.receive_port, args.save
+                args.receive_port, args.save,
+                no_downsample=args.no_downsample,
             )
 
             if success:
