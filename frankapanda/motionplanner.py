@@ -206,9 +206,9 @@ class MotionPlanner:
         self.world_config.add_obstacle(self.back_wall)
         self.world_config.add_obstacle(self.table)
         self.world_config.add_obstacle(self.front_wall)
-        self.world_config.add_obstacle(self.pointcloud_mesh)
+        # self.world_config.add_obstacle(self.pointcloud_mesh)
         self.world_config.add_obstacle(self.right_wall)
-        # self.world_config.add_obstacle(self.shelf_top)
+        self.world_config.add_obstacle(self.shelf_top)
         # self.world_config.add_obstacle(self.shelf_side_blocker)
         # self.world_config.add_obstacle(self.object_area_blocker)
 

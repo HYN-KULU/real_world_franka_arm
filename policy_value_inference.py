@@ -20,6 +20,7 @@ import os
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 # visplanWM model code, resolved via the .pth installed by
 # setup_frankapanda_3dfa.sh into the conda env site-packages.
@@ -90,11 +91,15 @@ def _unscale_xyz(xyz_norm: torch.Tensor, centroid: torch.Tensor, scale: torch.Te
 
 class PolicyValueInference:
     """
-    Cascaded grasp -> place policy (always loaded) plus optional value scoring.
+    Cascaded grasp -> place policy plus optional value scoring.
 
     Args:
         grasp_ckpt: path to grasp policy .pth (grasp_condition_dim=None).
+            Pass None to skip loading the grasp model (e.g. when only
+            placement sampling is needed); calls into infer() and
+            infer_grasps() will then error.
         place_ckpt: path to place policy .pth (grasp_condition_dim=7).
+            Pass None to skip loading the place model.
         value_ckpt: path to value network .pth. Required when use_value=True.
         device: target torch device (str or torch.device).
         use_value: if True, load + run the value network; output["value_score"]
@@ -104,8 +109,8 @@ class PolicyValueInference:
 
     def __init__(
         self,
-        grasp_ckpt: str,
-        place_ckpt: str,
+        grasp_ckpt: str = None,
+        place_ckpt: str = None,
         value_ckpt: str = None,
         device="cuda:0",
         use_value: bool = False,
@@ -113,25 +118,31 @@ class PolicyValueInference:
         self.device = torch.device(device) if isinstance(device, str) else device
         self.use_value = use_value
 
-        print("Building grasp policy")
-        grasp_kwargs = dict(_POLICY_KWARGS)
-        grasp_kwargs["trajectory_length"] = 1
-        grasp_kwargs["grasp_condition_dim"] = None
-        self.grasp_model = (
-            _load_checkpoint(grasp_ckpt, GraspPlaceActor(**grasp_kwargs))
-            .to(self.device)
-            .eval()
-        )
+        if grasp_ckpt is not None:
+            print("Building grasp policy")
+            grasp_kwargs = dict(_POLICY_KWARGS)
+            grasp_kwargs["trajectory_length"] = 1
+            grasp_kwargs["grasp_condition_dim"] = None
+            self.grasp_model = (
+                _load_checkpoint(grasp_ckpt, GraspPlaceActor(**grasp_kwargs))
+                .to(self.device)
+                .eval()
+            )
+        else:
+            self.grasp_model = None
 
-        print("Building place policy")
-        place_kwargs = dict(_POLICY_KWARGS)
-        place_kwargs["trajectory_length"] = 1
-        place_kwargs["grasp_condition_dim"] = 7
-        self.place_model = (
-            _load_checkpoint(place_ckpt, GraspPlaceActor(**place_kwargs))
-            .to(self.device)
-            .eval()
-        )
+        if place_ckpt is not None:
+            print("Building place policy")
+            place_kwargs = dict(_POLICY_KWARGS)
+            place_kwargs["trajectory_length"] = 1
+            place_kwargs["grasp_condition_dim"] = 7
+            self.place_model = (
+                _load_checkpoint(place_ckpt, GraspPlaceActor(**place_kwargs))
+                .to(self.device)
+                .eval()
+            )
+        else:
+            self.place_model = None
 
         if self.use_value:
             if value_ckpt is None:
@@ -174,6 +185,71 @@ class PolicyValueInference:
             pos = _unscale_xyz(norm[:3], centroid, scale)
             grasps.append(torch.cat([pos, norm[3:7]]))                 # (7,) wxyz
         return grasps
+
+    @torch.no_grad()
+    def infer_placements(
+        self,
+        pcd_np: np.ndarray,
+        mask_np: np.ndarray,
+        grasp_pose: np.ndarray,
+        num_placements: int = 32,
+        chunk_size: int = 4,
+    ):
+        """
+        Run the place policy num_placements times conditioned on a fixed
+        grasp pose (xyz+quat_wxyz, robot-base frame). Calls are split into
+        chunks of size chunk_size to bound peak attention memory; outputs
+        are concatenated. Returns a list of (7,) place poses in robot-base
+        frame.
+
+        The grasp pose's xyz is normalized with the current pcd's centroid/
+        scale before being passed as grasp_cond, matching the training-time
+        convention (see infer() above).
+        """
+        pcd_t = torch.from_numpy(pcd_np).float()
+        pcd_norm, centroid, scale = _center_and_scale(pcd_t)
+        mask_t = (
+            torch.from_numpy(mask_np.astype(np.float32))
+            .to(pcd_norm.dtype)
+            .unsqueeze(-1)
+        )
+        pcd_masked = torch.cat([pcd_norm, mask_t], dim=-1).unsqueeze(0).to(self.device)  # (1, N, 4)
+
+        if isinstance(grasp_pose, np.ndarray):
+            grasp_t = torch.from_numpy(grasp_pose).float()
+        elif isinstance(grasp_pose, torch.Tensor):
+            grasp_t = grasp_pose.detach().cpu().float()
+        else:
+            grasp_t = torch.tensor(grasp_pose, dtype=torch.float32)
+
+        grasp_pos_norm = (grasp_t[:3] - centroid) / scale
+        grasp_cond_one = torch.cat([grasp_pos_norm, grasp_t[3:7]]).unsqueeze(0).to(self.device)  # (1, 7)
+
+        placements = []
+        num_chunks = (num_placements + chunk_size - 1) // chunk_size
+        pbar = tqdm(total=num_placements, desc="placement inference", unit="sample")
+        remaining = num_placements
+        for _ in range(num_chunks):
+            k = min(chunk_size, remaining)
+            pcd_chunk = pcd_masked.expand(k, -1, -1).contiguous()
+            grasp_cond_chunk = grasp_cond_one.expand(k, -1).contiguous()
+            place_out = self.place_model(
+                gt_trajectory=None,
+                pcd=pcd_chunk,
+                proprioception=None,
+                run_inference=True,
+                grasp_cond=grasp_cond_chunk,
+            )                                                              # (k, 1, 8)
+            for i in range(k):
+                norm = place_out[i, 0].cpu()
+                pos = _unscale_xyz(norm[:3], centroid, scale)
+                placements.append(torch.cat([pos, norm[3:7]]))             # (7,) wxyz
+            del place_out, pcd_chunk, grasp_cond_chunk
+            torch.cuda.empty_cache()
+            remaining -= k
+            pbar.update(k)
+        pbar.close()
+        return placements
 
     @torch.no_grad()
     def infer(self, pcd_np: np.ndarray, mask_np: np.ndarray) -> dict:
