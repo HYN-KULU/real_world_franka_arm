@@ -32,6 +32,7 @@ Usage:
 
 import argparse
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -43,6 +44,7 @@ from robo_utils.conversion_utils import (
     pose_to_transformation,
     move_pose_along_local_z,
     rotate_pose_around_local_z,
+    rotate_pose_around_local_y,
 )
 
 from frankapanda import FrankaPandaController
@@ -73,14 +75,28 @@ DEFAULT_VALUE_CKPT = os.path.join(
 
 
 # --------------------------------------------------------------------------- #
+#                                                                             #
+#   >>>  USER EDIT POINT  <<<                                                 #
+#                                                                             #
+#   Integer ids for this collection run. Saved file is                        #
+#   data/shelf_packing_scenes/env_<ENV_ID>/grasps_<OBJECT_ID>.npz             #
+#   Change before each object collection.                                     #
+# --------------------------------------------------------------------------- #
+ENV_ID = 0
+OBJECT_ID = 3
+
+
+# --------------------------------------------------------------------------- #
 # Pose post-processing: force top-down (gripper z-axis = -world z), preserve yaw.
 # --------------------------------------------------------------------------- #
 
-def make_topdown(pose7_wxyz):
+def make_topdown(pose7_wxyz, tilt_deg_range=30.0):
     """
     Project a (7,) pose [x, y, z, qw, qx, qy, qz] onto the top-down manifold:
     gripper local z-axis aligned with -world_z. Yaw around world z is taken
-    from the input's gripper x-axis direction. Position is unchanged.
+    from the input's gripper x-axis direction. Position is unchanged. Then
+    apply a random tilt in [-tilt_deg_range, +tilt_deg_range] degrees around
+    the gripper's local +Y axis (uses robo_utils.rotate_pose_around_local_y).
     """
     is_tensor = isinstance(pose7_wxyz, torch.Tensor)
     p = pose7_wxyz.detach().cpu().numpy() if is_tensor else np.asarray(pose7_wxyz)
@@ -95,9 +111,9 @@ def make_topdown(pose7_wxyz):
     qx_o, qy_o, qz_o, qw_o = R_target.as_quat()
     out = np.concatenate([pos, [qw_o, qx_o, qy_o, qz_o]]).astype(np.float32)
 
-    out[..., 0] = out[..., 0] - 0.02
-    out[..., 1] = out[..., 1] - 0.02
-    out[..., 2] = out[..., 2] + 0.04
+    # Random tilt around local +Y axis.
+    tilt_rad = float(np.deg2rad(np.random.uniform(-tilt_deg_range, tilt_deg_range)))
+    out = rotate_pose_around_local_y(out, tilt_rad, format="wxyz").astype(np.float32)
 
     return torch.from_numpy(out) if is_tensor else out
 
@@ -135,7 +151,7 @@ def visualize_poses_in_pointcloud(pcd, poses, rgb=None, colors=None):
 # Robot execution of the predicted grasp (taken from primitives_demo.py)
 # --------------------------------------------------------------------------- #
 
-def execute_grasp(grasp_pose: torch.Tensor, pcd_np: np.ndarray, device: torch.device):
+def execute_grasp(controller, grasp_pose: torch.Tensor, pcd_np: np.ndarray, device: torch.device):
     """
     Mirror primitives_demo.main() end-to-end, with the policy-predicted grasp
     pose substituted for the hardcoded one. Sequence:
@@ -144,11 +160,12 @@ def execute_grasp(grasp_pose: torch.Tensor, pcd_np: np.ndarray, device: torch.de
              -> open -> reverse_target -> home
 
     Args:
+        controller: FrankaPandaController instance (instantiate once at top level;
+                    creating it multiple times in one process errors out).
         grasp_pose: (7,) torch.Tensor xyz + quat_wxyz in robot-base frame.
         pcd_np: scene point cloud used to populate the motion planner world.
         device: torch device for joint/pose tensors (motion_planner expects cuda).
     """
-    controller = FrankaPandaController()
     controller.move_to_joints(controller.home_joints, controller.open_gripper_action)
 
     current_joints = controller.get_robot_joints()
@@ -179,27 +196,27 @@ def execute_grasp(grasp_pose: torch.Tensor, pcd_np: np.ndarray, device: torch.de
     lift_pose[2] = target_shelf_pose[2]
 
     # Intermediate retraction in front of shelf before insertion.
-    inter_pose = target_shelf_pose.clone()
-    inter_pose[0] = target_shelf_pose[0]
-    inter_pose[1] = -0.25
-    inter_pose[2] = target_shelf_pose[2]
+    # inter_pose = target_shelf_pose.clone()
+    # inter_pose[0] = target_shelf_pose[0]
+    # inter_pose[1] = -0.25
+    # inter_pose[2] = target_shelf_pose[2]
 
     # Visualize the planned waypoints before executing anything.
     # cyan=pre_grasp, green=grasp, yellow=lift, orange=inter, blue=target_shelf.
-    print("Visualizing intermediate poses in pcd: "
-          "cyan=pre_grasp, green=grasp, yellow=lift, orange=inter, blue=target")
-    visualize_poses_in_pointcloud(
-        pcd_np,
-        [pre_grasp_pose, grasp_pose, lift_pose, inter_pose, target_shelf_pose],
-        rgb=None,
-        colors=[
-            (0.0, 1.0, 1.0),  # cyan
-            (0.0, 1.0, 0.0),  # green
-            (1.0, 1.0, 0.0),  # yellow
-            (1.0, 0.5, 0.0),  # orange
-            (0.0, 0.0, 1.0),  # blue
-        ],
-    )
+    # print("Visualizing intermediate poses in pcd: "
+    #       "cyan=pre_grasp, green=grasp, yellow=lift, orange=inter, blue=target")
+    # visualize_poses_in_pointcloud(
+    #     pcd_np,
+    #     [pre_grasp_pose, grasp_pose, lift_pose, inter_pose, target_shelf_pose],
+    #     rgb=None,
+    #     colors=[
+    #         (0.0, 1.0, 1.0),  # cyan
+    #         (0.0, 1.0, 0.0),  # green
+    #         (1.0, 1.0, 0.0),  # yellow
+    #         (1.0, 0.5, 0.0),  # orange
+    #         (0.0, 0.0, 1.0),  # blue
+    #     ],
+    # )
 
     controller.open_gripper()
 
@@ -225,57 +242,56 @@ def execute_grasp(grasp_pose: torch.Tensor, pcd_np: np.ndarray, device: torch.de
     )
     print(f"  lift success: {lift_success.item()}")
 
-    inter_pose_trajectories, inter_pose_success = motion_planner.plan_to_goal_poses(
-        current_joints=lift_trajectories[0, -1].unsqueeze(0),
-        goal_poses=inter_pose.unsqueeze(0),
-        plan_config=motion_planner.only_xy_translation_plan_config,
-    )
-    print(f"  inter_pose success: {inter_pose_success.item()}")
+    # inter_pose_trajectories, inter_pose_success = motion_planner.plan_to_goal_poses(
+    #     current_joints=lift_trajectories[0, -1].unsqueeze(0),
+    #     goal_poses=inter_pose.unsqueeze(0),
+    #     plan_config=motion_planner.only_xy_translation_plan_config,
+    # )
+    # print(f"  inter_pose success: {inter_pose_success.item()}")
 
-    target_trajectories, target_success = motion_planner.plan_to_goal_poses(
-        current_joints=inter_pose_trajectories[0, -1].unsqueeze(0),
-        goal_poses=target_shelf_pose.unsqueeze(0),
-        disable_collision_links=motion_planner.links[-5:],
-        plan_config=motion_planner.along_z_axis_plan_config,
-    )
-    print(f"  target success: {target_success.item()}")
+    # target_trajectories, target_success = motion_planner.plan_to_goal_poses(
+    #     current_joints=inter_pose_trajectories[0, -1].unsqueeze(0),
+    #     goal_poses=target_shelf_pose.unsqueeze(0),
+    #     disable_collision_links=motion_planner.links[-5:],
+    #     plan_config=motion_planner.along_z_axis_plan_config,
+    # )
+    # print(f"  target success: {target_success.item()}")
 
-    success = (
-        pre_grasp_success.item()
-        & grasp_success.item()
-        & lift_success.item()
-        & inter_pose_success.item()
-        & target_success.item()
+    planning_success = bool(
+        pre_grasp_success.item() & grasp_success.item() & lift_success.item()
     )
-    if not success:
+
+    pre_grasp_np = pre_grasp_trajectories[0].cpu().numpy() if pre_grasp_success.item() else None
+    grasp_np = grasp_trajectories[0].cpu().numpy() if grasp_success.item() else None
+    lift_np = lift_trajectories[0].cpu().numpy() if lift_success.item() else None
+
+    if not planning_success:
         print("  ABORT: one or more plans failed.")
         controller.move_to_joints(controller.home_joints, controller.close_gripper_action)
         controller.open_gripper()
-        return
+        return {
+            "pre_grasp_traj": pre_grasp_np,
+            "grasp_traj": grasp_np,
+            "lift_traj": lift_np,
+            "planning_success": False,
+            "executed": False,
+        }
 
-    controller.move_along_trajectory(
-        pre_grasp_trajectories[0].cpu().numpy(), controller.open_gripper_action
-    )
-    controller.move_along_trajectory(
-        grasp_trajectories[0].cpu().numpy(), controller.open_gripper_action
-    )
-    controller.close_gripper(num_steps=80)
-    controller.move_along_trajectory(
-        lift_trajectories[0].cpu().numpy(), controller.close_gripper_action
-    )
-    controller.move_along_trajectory(
-        inter_pose_trajectories[0].cpu().numpy(), controller.close_gripper_action
-    )
-    controller.move_along_trajectory(
-        target_trajectories[0].cpu().numpy(), controller.close_gripper_action
-    )
-    controller.open_gripper(num_steps=80)
-    controller.move_along_trajectory(
-        target_trajectories[0].flip(0).cpu().numpy(), controller.open_gripper_action
-    )
+    controller.move_along_trajectory(pre_grasp_np, controller.open_gripper_action)
+    controller.move_along_trajectory(grasp_np, controller.open_gripper_action)
+    # controller.close_gripper(num_steps=80)
+    controller.move_along_trajectory(lift_np, controller.close_gripper_action)
 
     controller.move_to_joints(controller.home_joints, controller.close_gripper_action)
     controller.open_gripper()
+
+    return {
+        "pre_grasp_traj": pre_grasp_np,
+        "grasp_traj": grasp_np,
+        "lift_traj": lift_np,
+        "planning_success": True,
+        "executed": True,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -293,13 +309,14 @@ def main():
                         help="Also load and run the value network; print + use the scalar score.")
     parser.add_argument("--no_viz", action="store_true",
                         help="Skip Open3D visualization (headless).")
-    parser.add_argument("--no_exec", dest="execute", action="store_false",
-                        help="Skip robot execution (default: execute the predicted grasp).")
-    parser.set_defaults(execute=True)
     parser.add_argument("--target_label", type=str, default=None,
                         help="Pick this segmentation label (e.g. 'blue block') as the target. "
                              "If unset and seg_labels are present, picks the first non-empty label. "
                              "Falls back to a random DBSCAN cluster if no seg_labels in payload.")
+    parser.add_argument("--num_grasps", type=int, default=5,
+                        help="Number of grasp candidates to sample from the grasp policy.")
+    parser.add_argument("--save_dir", type=str, default="data/shelf_packing_scenes",
+                        help="Root dir for saved grasps_<label>.npz files.")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -357,6 +374,7 @@ def main():
         print(f"  pcd: {pcd_np.shape}  clusters: {num_clusters} (no seg_labels — falling back)")
         chosen_cid = int(np.random.randint(num_clusters))
         mask_np = (cluster_labels == chosen_cid).astype(np.float32)
+        chosen_name = f"cluster_{chosen_cid}"
         print(f"  chosen cluster: {chosen_cid} ({int(mask_np.sum())}/{len(pcd_np)} points)")
     else:
         raise RuntimeError(
@@ -366,44 +384,114 @@ def main():
 
     # 4. Visualize the chosen cluster (red) on full pcd (gray).
     # if not args.no_viz:
-    #     viz_rgb = np.where(
-    #         mask_np[:, None].astype(bool),
-    #         np.array([1.0, 0.0, 0.0], dtype=np.float32),
-    #         np.array([0.5, 0.5, 0.5], dtype=np.float32),
-    #     )
-    #     plot_pcd(pcd_np, viz_rgb, base_frame=True)
+    viz_rgb = np.where(
+        mask_np[:, None].astype(bool),
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.5, 0.5, 0.5], dtype=np.float32),
+    )
+    plot_pcd(pcd_np, viz_rgb, base_frame=True)
 
-    # 5. Inference.
-    result = inference.infer(pcd_np, mask_np)
-    grasp_pose_robot = result["grasp_pose"]
-    place_pose_robot = result["place_pose"]
+    # 5. Inference: sample K top-down grasp candidates; visualize all.
+    grasps = inference.infer_grasps(pcd_np, mask_np, num_grasps=args.num_grasps)
+    grasps = [make_topdown(g) for g in grasps]
+    print(f"  predicted {len(grasps)} top-down grasp candidates:")
+    for i, g in enumerate(grasps):
+        print(f"    [{i}] {g.tolist()}")
 
-    # Force top-down grasp: gripper z-axis -> -world z, yaw preserved from policy.
-    grasp_pose_robot = make_topdown(grasp_pose_robot)
-    print(f"  grasp pose (xyz+quat_wxyz, robot frame, top-down): {grasp_pose_robot.tolist()}")
-    print(f"  place pose (xyz+quat_wxyz, robot frame, raw): {place_pose_robot.tolist()}")
-    if result["value_score"] is not None:
-        print(f"  value score (sigmoid): {result['value_score']:.4f}")
+    # Bump every grasp position +5cm in z before execution (safety offset).
+    for g in grasps:
+        g[2] = g[2] + 0.05
 
-    # 6. Visualize grippers + cluster highlight.
-    # if not args.no_viz:
-    #     print("Visualizing: red=target cluster, gray=rest, green=grasp, blue=place")
-    #     viz_rgb = np.where(
-    #         mask_np[:, None].astype(bool),
-    #         np.array([1.0, 0.0, 0.0], dtype=np.float32),
-    #         np.array([0.5, 0.5, 0.5], dtype=np.float32),
-    #     )
-    #     visualize_poses_in_pointcloud(
-    #         pcd_np,
-    #         [grasp_pose_robot, place_pose_robot],
-    #         rgb=viz_rgb,
-    #         colors=[(0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
-    #     )
+    GRASP_COLORS = [
+        (1.0, 0.0, 0.0),  # red
+        (0.0, 1.0, 0.0),  # green
+        (0.0, 0.0, 1.0),  # blue
+        (1.0, 1.0, 0.0),  # yellow
+        (1.0, 0.0, 1.0),  # magenta
+        (0.0, 1.0, 1.0),  # cyan
+        (1.0, 0.5, 0.0),  # orange
+    ]
+    viz_rgb = np.where(
+        mask_np[:, None].astype(bool),
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.5, 0.5, 0.5], dtype=np.float32),
+    )
+    visualize_poses_in_pointcloud(
+        pcd_np,
+        grasps,
+        rgb=viz_rgb,
+        colors=[GRASP_COLORS[i % len(GRASP_COLORS)] for i in range(len(grasps))],
+    )
 
-    # 7. Optional execution of the predicted grasp on the real robot.
-    if args.execute:
-        print("Executing predicted grasp on robot")
-        execute_grasp(grasp_pose_robot, pcd_np, device)
+    # 7. Setup save path + atomic save helper (called after every prompt so
+    # a mid-loop crash never loses progress).
+    env_dir = Path(args.save_dir) / f"env_{ENV_ID}"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    save_path = env_dir / f"grasps_{OBJECT_ID}.npz"
+    # np.savez appends .npz if not present; keep .npz at the end so the
+    # filename it actually writes matches what we pass to os.replace().
+    tmp_path = env_dir / f"grasps_{OBJECT_ID}.tmp.npz"
+
+    def save_progress(grasp_list, traj_list, success_list):
+        grasps_arr = np.stack(grasp_list).astype(np.float32)
+        trajs_arr = np.array(traj_list, dtype=object)
+        successes_arr = np.array(success_list, dtype=bool)
+        np.savez(
+            tmp_path,
+            grasps=grasps_arr,
+            trajectories=trajs_arr,
+            successes=successes_arr,
+            target_label=np.array(chosen_name),
+            object_id=np.array(OBJECT_ID),
+            env_id=np.array(ENV_ID),
+            pcd=pcd_np.astype(np.float32),
+        )
+        os.replace(tmp_path, save_path)  # atomic on POSIX
+        print(f"  saved {len(grasp_list)} grasps "
+              f"({int(successes_arr.sum())} successful) -> {save_path}")
+
+    # Execute each grasp; collect concatenated trajectory + user-rated success.
+    # Controller MUST be instantiated exactly once per process.
+    controller = FrankaPandaController()
+    grasp_poses_to_save = []
+    full_trajectories = []
+    successes = []
+
+    for i, grasp_pose_robot in enumerate(grasps):
+        print(f"\n=== Executing grasp candidate {i+1}/{len(grasps)} ===")
+        res = execute_grasp(controller, grasp_pose_robot, pcd_np, device)
+
+        if res["planning_success"]:
+            full_traj = np.concatenate(
+                [res["pre_grasp_traj"], res["grasp_traj"], res["lift_traj"]],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            full_traj = np.zeros((0, 7), dtype=np.float32)
+
+        if res["executed"]:
+            while True:
+                ans = input(f"Grasp {i+1} successful? [y/N]: ").strip().lower()
+                if ans in ("y", "yes"):
+                    is_success = True
+                    break
+                if ans in ("", "n", "no"):
+                    is_success = False
+                    break
+                print("  Please answer y or n.")
+        else:
+            print("  Skipped prompt: grasp not executed (planning failed).")
+            is_success = False
+
+        grasp_poses_to_save.append(
+            grasp_pose_robot.detach().cpu().numpy()
+            if isinstance(grasp_pose_robot, torch.Tensor) else np.asarray(grasp_pose_robot)
+        )
+        full_trajectories.append(full_traj)
+        successes.append(is_success)
+
+        # Incremental save right after the prompt: no progress lost on crash.
+        save_progress(grasp_poses_to_save, full_trajectories, successes)
 
     perception.close()
 

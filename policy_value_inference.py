@@ -146,6 +146,36 @@ class PolicyValueInference:
             self.value_model = None
 
     @torch.no_grad()
+    def infer_grasps(self, pcd_np: np.ndarray, mask_np: np.ndarray, num_grasps: int = 5):
+        """
+        Run the grasp policy num_grasps times with independent denoising noise
+        (batched in a single forward), return a list of (7,) grasp poses in
+        robot-base frame. Place + value are NOT called.
+        """
+        pcd_t = torch.from_numpy(pcd_np).float()
+        pcd_norm, centroid, scale = _center_and_scale(pcd_t)
+        mask_t = (
+            torch.from_numpy(mask_np.astype(np.float32))
+            .to(pcd_norm.dtype)
+            .unsqueeze(-1)
+        )
+        pcd_masked = torch.cat([pcd_norm, mask_t], dim=-1).unsqueeze(0)  # (1, N, 4)
+        pcd_batched = pcd_masked.expand(num_grasps, -1, -1).contiguous().to(self.device)
+
+        grasp_out = self.grasp_model(
+            gt_trajectory=None,
+            pcd=pcd_batched,
+            proprioception=None,
+            run_inference=True,
+        )                                                              # (K, 1, 8)
+        grasps = []
+        for i in range(num_grasps):
+            norm = grasp_out[i, 0].cpu()
+            pos = _unscale_xyz(norm[:3], centroid, scale)
+            grasps.append(torch.cat([pos, norm[3:7]]))                 # (7,) wxyz
+        return grasps
+
+    @torch.no_grad()
     def infer(self, pcd_np: np.ndarray, mask_np: np.ndarray) -> dict:
         """
         Run cascaded grasp -> place (and optional value scoring) on one scene.
