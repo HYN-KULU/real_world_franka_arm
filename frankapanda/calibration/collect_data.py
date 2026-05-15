@@ -38,7 +38,7 @@ def move_robot_and_record_data(
     data = []
     for _ in tqdm(range(num_movements)):
         # Generate a random target delta pose
-        random_delta_pos = [np.random.uniform(-0.06, 0.06, size=(3,))]
+        random_delta_pos = [np.random.uniform(-0.02, 0.02, size=(3,))]
         random_delta_axis_angle = [np.random.uniform(-0.5, 0.5, size=(3,))]
         robot.reset(joint_positions=initial_joint_positions)
         # import pdb; pdb.set_trace()

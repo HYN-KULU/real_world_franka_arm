@@ -1,0 +1,43 @@
+(franka) yinongh@torsion:~/automate/real_world_visual_planning/frankapanda/calibration$ /usr/local/zed/tools/ZED_Explorer --all
+## Cam  0  ##
+ Model :  "ZED-M"
+ S/N :  10296178
+ State :  "AVAILABLE"
+ Path :  /dev/video2
+ ID :  0
+ Type :  "USB"
+********************
+## Cam  1  ##
+ Model :  "ZED 2i"
+ S/N :  38552990
+ State :  "AVAILABLE"
+ Path :  /dev/video4
+ ID :  1
+ Type :  "USB"
+
+
+# unplug ZED 2i
+sleep 10
+
+# plug it back in with the good cable
+lsusb | grep -i stereolabs
+lsusb -t
+v4l2-ctl --list-devices | grep -A3 -i zed
+/usr/local/zed/tools/ZED_Explorer --sn 38552990
+
+pkill ZED_Explorer
+fuser -v /dev/video4 /dev/video5
+
+
+Before Python, verify calibration file placement:
+ls -lh /usr/local/zed/settings/SN38552990.conf
+head -5 /usr/local/zed/settings/SN38552990.conf
+
+(franka) yinongh@torsion:~/automate/real_world_visual_planning/frankapanda/calibration$ ls -lh /usr/local/zed/settings/SN38552990.conf
+head -5 /usr/local/zed/settings/SN38552990.conf
+-rw-r--r-- 1 root root 2.6K May 15 04:17 /usr/local/zed/settings/SN38552990.conf
+[LEFT_CAM_2K]
+fx=1066.1291835702143
+fy=1066.2078550800052
+cx=1105.6969754386291
+cy=611.9140411934122
