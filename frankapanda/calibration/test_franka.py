@@ -22,32 +22,32 @@ def main():
     robot = FrankaOSCController(tip_offset=np.zeros(3))
 
     # send robot to home/reset (best-effort)
-    # try:
-    #     if hasattr(robot, "go_home"):
-    #         robot.go_home()
-    #     elif hasattr(robot, "goto_home"):
-    #         robot.goto_home()
-    #     else:
-    #         robot.reset()
-    # except Exception:
-    #     try:
-    #         home_joints = [-0.74921682, 0.13623207, 0.37435664, -2.00871515, -0.54053575, 2.19774203, 2.34971468]
-    #         robot.reset(joint_positions=home_joints)
-    #     except Exception as e:
-    #         print("Failed to move robot to home:", e)
-    #         return
+    try:
+        if hasattr(robot, "go_home"):
+            robot.go_home()
+        elif hasattr(robot, "goto_home"):
+            robot.goto_home()
+        else:
+            robot.reset()
+    except Exception:
+        try:
+            home_joints = [-0.74921682, 0.13623207, 0.37435664, -2.00871515, -0.54053575, 2.19774203, 2.34971468]
+            robot.reset(joint_positions=home_joints)
+        except Exception as e:
+            print("Failed to move robot to home:", e)
+            return
 
-    # time.sleep(1.0)
+    time.sleep(1.0)
 
-    # # small relative move to ensure a changed pose (optional)
-    # try:
-    #     delta_pos = [np.array([0.08, 0.28, -0.03])]  # down 3 cm
-    #     delta_axis_angle = [np.array([0.0, 0.0, 0.0])]
-    #     robot.move_by(delta_pos, delta_axis_angle, num_steps=400, num_additional_steps=0)
-    # except Exception:
-    #     pass
+    # small relative move to ensure a changed pose (optional)
+    try:
+        delta_pos = [np.array([0.08, 0.28, -0.03])]  # down 3 cm
+        delta_axis_angle = [np.array([0.0, 0.0, 0.0])]
+        robot.move_by(delta_pos, delta_axis_angle, num_steps=400, num_additional_steps=0)
+    except Exception:
+        pass
 
-    # time.sleep(0.5)
+    time.sleep(0.5)
 
     # Initialize Kinect and get calibration (use DEPTH intrinsics as in collect_data.py)
     k4a = PyK4A(device_id=cam_id)

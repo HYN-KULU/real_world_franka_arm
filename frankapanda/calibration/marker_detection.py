@@ -63,8 +63,7 @@ def estimate_transformation(corners, ids, camera_matrix, dist_coeffs):
     """
     if ids is not None and len(ids) > 0:
         # Assuming marker size is known
-        marker_size = 0.04277777777  # In meters
-        # marker_size = 0.05  # In meters
+        marker_size = 0.042  # In meters
 
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, marker_size, camera_matrix, dist_coeffs)
 
